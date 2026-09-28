@@ -1,7 +1,7 @@
 # mpvsync
 
 使用P2P的Syncplay插件，同步暂停、播放以及视频进度
-
+在使用前请确保双方加载同一个播放列表
 适用于 libmpv 类播放器（mpv,hills等）
 
 ## 编译

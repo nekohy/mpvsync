@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"math"
 	"net"
 	"time"
@@ -18,11 +19,16 @@ type client struct {
 	peers  []net.Addr
 
 	pos, posT, speed      float64
-	file                  string // file name, identifies the file
+	name                  string   // current file name
+	size                  int64    // current file size
+	playlist              []string // file names in the mpv playlist
 	hasPos, sawPath       bool
 	paused, buffering     bool
 	loaded, restarted     bool
-	ready                 bool // a file is loaded and has settled: user actions count from now on
+	ready                 bool   // a file is loaded and has settled: user actions count from now on
+	hadFile               bool   // a file was ready before: the next one is a switch
+	followed              string // file we switched to because a peer did (not our own switch)
+	missPause             bool   // a peer lacks the file we switched to: pause once ready
 	settleAt, readyAt     float64
 	expectPause           *bool // pause change we asked for (not a user action)
 	ourSeeks              int   // seeks we issued that have not finished (mpv may merge them)
@@ -33,7 +39,7 @@ type client struct {
 
 type pktIn struct {
 	p    Pkt
-	from string
+	addr net.Addr
 }
 
 func run(ipcPath string, peers []net.Addr, port int) error {
@@ -46,7 +52,7 @@ func run(ipcPath string, peers []net.Addr, port int) error {
 		return err
 	}
 	c := &client{start: time.Now(), player: player, udp: udp, peers: peers, speed: 1, paused: true}
-	for i, p := range []string{"pause", "time-pos", "path", "speed", "paused-for-cache"} {
+	for i, p := range []string{"pause", "time-pos", "path", "file-size", "playlist", "speed", "paused-for-cache"} {
 		c.cmd("observe_property", i+1, p)
 	}
 
@@ -60,8 +66,7 @@ func run(ipcPath string, peers []net.Addr, port int) error {
 			}
 			var p Pkt
 			if json.Unmarshal(buf[:n], &p) == nil {
-				host, _, _ := net.SplitHostPort(addr.String())
-				pktCh <- pktIn{p, host}
+				pktCh <- pktIn{p, addr}
 			}
 		}
 	}()
@@ -74,7 +79,7 @@ func run(ipcPath string, peers []net.Addr, port int) error {
 			}
 			c.onMpv(e)
 		case in := <-pktCh:
-			c.onPkt(in.p, in.from)
+			c.onPkt(in.p, in.addr)
 		case <-tick.C:
 			c.tick()
 		}
@@ -115,8 +120,20 @@ func (c *client) send(p Pkt) {
 	}
 }
 
+func (c *client) reply(a net.Addr, p Pkt) {
+	b, _ := json.Marshal(p)
+	c.udp.WriteTo(b, a)
+}
+
+// file identifies the current file: hash of its name and size.
+func (c *client) file() string {
+	h := fnv.New64a()
+	fmt.Fprintf(h, "%s\x00%d", c.name, c.size)
+	return fmt.Sprintf("%016x", h.Sum64())
+}
+
 func (c *client) state(op, seek bool) Pkt {
-	return Pkt{Op: op, Seek: seek, File: c.file, Pos: c.curPos(), Paused: c.paused}
+	return Pkt{Op: op, Seek: seek, File: c.file(), Pos: c.curPos(), Paused: c.paused}
 }
 
 // act: the local user paused / played / seeked.
@@ -159,11 +176,21 @@ func (c *client) onMpv(e mpv.Event) {
 		case "path":
 			var p string
 			json.Unmarshal(e.Data, &p)
-			c.file = fileName(p)
+			c.name = fileName(p)
 			if !c.sawPath && p != "" {
 				c.onLoaded(true) // attached after the file was loaded
 			}
 			c.sawPath = true
+		case "file-size":
+			c.size = 0
+			json.Unmarshal(e.Data, &c.size)
+		case "playlist":
+			var list []struct{ Filename string }
+			json.Unmarshal(e.Data, &list)
+			c.playlist = c.playlist[:0]
+			for _, x := range list {
+				c.playlist = append(c.playlist, fileName(x.Filename))
+			}
 		}
 	case "file-loaded":
 		c.onLoaded(false)
@@ -186,14 +213,25 @@ func (c *client) onMpv(e mpv.Event) {
 }
 
 func (c *client) onLoaded(alreadyPlaying bool) {
-	c.loaded, c.ready, c.restarted = true, false, alreadyPlaying
+	c.loaded, c.ready, c.restarted, c.missPause = true, false, alreadyPlaying, false
 	c.settleAt, c.ourSeeks = c.now()+1.5, 0
+	if !alreadyPlaying && c.hadFile && c.name != c.followed { // the user switched files: take the others along
+		c.send(Pkt{Load: true, Name: c.name})
+	}
+	c.followed = ""
 }
 
 func (c *client) tick() {
 	now := c.now()
 	if c.loaded && !c.ready && c.restarted && now >= c.settleAt && c.hasPos {
-		c.ready, c.readyAt, c.nextHB = true, now, 0
+		c.ready, c.readyAt, c.nextHB, c.hadFile = true, now, 0, true
+	}
+	if c.missPause && c.ready {
+		c.missPause = false
+		if !c.paused {
+			c.setPause(true)
+			c.act(false) // everyone else on this file waits too
+		}
 	}
 	if c.seekOpAt > 0 && now >= c.seekOpAt {
 		c.seekOpAt = 0
@@ -207,8 +245,31 @@ func (c *client) tick() {
 	}
 }
 
-func (c *client) onPkt(p Pkt, from string) {
-	if !c.ready || p.File == "" || p.File != c.file {
+func (c *client) onPkt(p Pkt, addr net.Addr) {
+	from, _, _ := net.SplitHostPort(addr.String())
+	switch {
+	case p.Load && p.Name != c.name:
+		for i, n := range c.playlist { // follow a peer's switch if that file is in our playlist
+			if n == p.Name {
+				c.followed = p.Name
+				c.cmd("playlist-play-index", i)
+				c.osd("%s 切到了 %s", from, show(p.Name))
+				return
+			}
+		}
+		c.reply(addr, Pkt{Miss: true, Name: p.Name})
+		c.osd("%s 切到了 %s，播放列表里没有，请手动打开", from, show(p.Name))
+		return
+	case p.Load:
+		return
+	case p.Miss:
+		if p.Name == c.name {
+			c.missPause = true
+			c.osd("%s 的播放列表里没有这一集，已暂停等待", from)
+		}
+		return
+	}
+	if !c.ready || p.File != c.file() {
 		return
 	}
 	now, diff := c.now(), p.Pos-c.curPos()

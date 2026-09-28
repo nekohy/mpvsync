@@ -3,9 +3,11 @@
 //	mpvsync -ipc <mpv-ipc> -peers <ip[:port],...> [-port 7373]   (started by mpvsync.lua)
 //
 // Stateless UDP: when the local user pauses / plays / seeks, the new state is sent to every peer, which
-// applies it if it plays the same file (same file name). Once a second a heartbeat with the position
+// applies it if it plays the same file (same file name and size). Once a second a heartbeat with the position
 // is sent too; whoever is more than 2s behind a playing peer seeks forward to it, and whoever has just
-// opened the file while a peer is paused pauses at its position. Nothing is remembered.
+// opened the file while a peer is paused pauses at its position. Switching to another file takes the peers
+// along if they have that file in their playlist; a peer without it replies, and the switcher pauses to wait.
+// Nothing is remembered.
 package main
 
 import (
@@ -15,15 +17,22 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"path"
+	"path/filepath"
 	"strconv"
 	"strings"
+
+	"golang.org/x/text/unicode/norm"
 )
 
 // Pkt is one UDP datagram (JSON): a user action (Op) or a heartbeat.
 type Pkt struct {
 	Op     bool    `json:"op,omitempty"`
 	Seek   bool    `json:"seek,omitempty"`
-	File   string  `json:"file"`
+	Load   bool    `json:"load,omitempty"` // the user switched to file Name
+	Miss   bool    `json:"miss,omitempty"` // reply to Load: file Name is not in my playlist
+	File   string  `json:"file"`           // hash of file name + size
+	Name   string  `json:"name,omitempty"` // url-encoded file name, only with Load / Miss
 	Pos    float64 `json:"pos"`
 	Paused bool    `json:"paused"`
 }
@@ -59,16 +68,25 @@ func parsePeers(list string, port int) []net.Addr {
 	return out
 }
 
-// fileName: last path component without the query string (e.g. ?sign=...), percent-decoded.
+// fileName: the file name of a local path or URL (query string such as ?sign=... dropped), Unicode-normalized
+// and url-encoded into one canonical form, so every peer derives the same name for the same file.
 func fileName(p string) string {
-	if strings.Contains(p, "://") {
-		p, _, _ = strings.Cut(p, "?")
+	if p == "" {
+		return ""
 	}
-	p = p[strings.LastIndexAny(p, `/\`)+1:]
-	if s, err := url.PathUnescape(p); err == nil {
+	name := filepath.Base(p)
+	if u, err := url.Parse(p); err == nil && len(u.Scheme) > 1 { // a URL, not a drive letter
+		name = path.Base(u.Path)
+	}
+	return url.PathEscape(norm.NFC.String(name))
+}
+
+// show: a file name for the OSD.
+func show(name string) string {
+	if s, err := url.PathUnescape(name); err == nil {
 		return s
 	}
-	return p
+	return name
 }
 
 func fmtTime(t float64) string {
