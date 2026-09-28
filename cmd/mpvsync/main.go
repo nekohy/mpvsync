@@ -3,7 +3,7 @@
 //	mpvsync -ipc <mpv-ipc> -peers <ip[:port],...> [-port 7373]   (started by mpvsync.lua)
 //
 // Stateless UDP: when the local user pauses / plays / seeks, the new state is sent to every peer, which
-// applies it if it plays the same file (matched by duration). Once a second a heartbeat with the position
+// applies it if it plays the same file (same size in bytes; duration if the size is unknown). Once a second a heartbeat with the position
 // is sent too; whoever is more than 2s behind a playing peer seeks forward to it, and whoever has just
 // opened the file while a peer is paused pauses at its position. Nothing is remembered.
 package main
@@ -22,6 +22,7 @@ import (
 type Pkt struct {
 	Op     bool    `json:"op,omitempty"`
 	Seek   bool    `json:"seek,omitempty"`
+	Size   int64   `json:"size,omitempty"` // file size in bytes: identifies the file
 	Dur    float64 `json:"dur"`
 	Pos    float64 `json:"pos"`
 	Paused bool    `json:"paused"`
@@ -57,8 +58,6 @@ func parsePeers(list string, port int) []net.Addr {
 	}
 	return out
 }
-
-func sameFile(a, b float64) bool { return a > 0 && b > 0 && math.Abs(a-b) < 0.5 }
 
 func fmtTime(t float64) string {
 	s := int(math.Max(t, 0) + 0.5)
