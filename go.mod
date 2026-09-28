@@ -1,4 +1,4 @@
-module mpvsync
+module github.com/nekohy/mpvsync
 
 go 1.22
 

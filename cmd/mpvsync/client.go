@@ -8,7 +8,7 @@ import (
 	"net"
 	"time"
 
-	"mpvsync/internal/mpv"
+	"github.com/nekohy/mpvsync/internal/mpv"
 )
 
 // client bridges one mpv instance and the peers. All state is owned by the event loop in run.
