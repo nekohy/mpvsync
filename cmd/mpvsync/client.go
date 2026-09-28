@@ -17,8 +17,8 @@ type client struct {
 	udp    net.PacketConn
 	peers  []net.Addr
 
-	pos, posT, speed, dur float64
-	size                  int64
+	pos, posT, speed      float64
+	file                  string // file name, identifies the file
 	hasPos, sawPath       bool
 	paused, buffering     bool
 	loaded, restarted     bool
@@ -46,7 +46,7 @@ func run(ipcPath string, peers []net.Addr, port int) error {
 		return err
 	}
 	c := &client{start: time.Now(), player: player, udp: udp, peers: peers, speed: 1, paused: true}
-	for i, p := range []string{"pause", "time-pos", "duration", "file-size", "path", "speed", "paused-for-cache"} {
+	for i, p := range []string{"pause", "time-pos", "path", "speed", "paused-for-cache"} {
 		c.cmd("observe_property", i+1, p)
 	}
 
@@ -116,7 +116,7 @@ func (c *client) send(p Pkt) {
 }
 
 func (c *client) state(op, seek bool) Pkt {
-	return Pkt{Op: op, Seek: seek, Size: c.size, Dur: c.dur, Pos: c.curPos(), Paused: c.paused}
+	return Pkt{Op: op, Seek: seek, File: c.file, Pos: c.curPos(), Paused: c.paused}
 }
 
 // act: the local user paused / played / seeked.
@@ -150,12 +150,6 @@ func (c *client) onMpv(e mpv.Event) {
 			} else {
 				c.hasPos = false
 			}
-		case "file-size":
-			c.size = 0
-			json.Unmarshal(e.Data, &c.size)
-		case "duration":
-			c.dur = 0
-			json.Unmarshal(e.Data, &c.dur)
 		case "speed":
 			c.speed = 1
 			json.Unmarshal(e.Data, &c.speed)
@@ -165,6 +159,7 @@ func (c *client) onMpv(e mpv.Event) {
 		case "path":
 			var p string
 			json.Unmarshal(e.Data, &p)
+			c.file = fileName(p)
 			if !c.sawPath && p != "" {
 				c.onLoaded(true) // attached after the file was loaded
 			}
@@ -212,16 +207,8 @@ func (c *client) tick() {
 	}
 }
 
-// sameFile: same size in bytes; duration only when a size is unknown (e.g. some streams).
-func (c *client) sameFile(p Pkt) bool {
-	if p.Size > 0 && c.size > 0 {
-		return p.Size == c.size
-	}
-	return p.Dur > 0 && c.dur > 0 && math.Abs(p.Dur-c.dur) < 0.5
-}
-
 func (c *client) onPkt(p Pkt, from string) {
-	if !c.ready || !c.sameFile(p) {
+	if !c.ready || p.File == "" || p.File != c.file {
 		return
 	}
 	now, diff := c.now(), p.Pos-c.curPos()
