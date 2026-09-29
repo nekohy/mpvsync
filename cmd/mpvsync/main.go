@@ -68,8 +68,11 @@ func parsePeers(list string, port int) []net.Addr {
 	return out
 }
 
-// fileName: the file name of a local path or URL (query string such as ?sign=... dropped), Unicode-normalized
-// and url-encoded into one canonical form, so every peer derives the same name for the same file.
+// fileName returns a canonical identifier for a local path or URL. Jellyfin
+// gives every video a generic URL basename such as stream.mkv, so use its
+// mediaSourceId query parameter for those URLs. Otherwise, use the basename.
+// The result is Unicode-normalized and URL-encoded so every peer derives the
+// same identifier for the same file.
 func fileName(p string) string {
 	if p == "" {
 		return ""
@@ -77,8 +80,27 @@ func fileName(p string) string {
 	name := filepath.Base(p)
 	if u, err := url.Parse(p); err == nil && len(u.Scheme) > 1 { // a URL, not a drive letter
 		name = path.Base(u.Path)
+		if isGenericStreamName(name) {
+			if mediaSourceID := queryValueFold(u.Query(), "mediaSourceId"); mediaSourceID != "" {
+				name = mediaSourceID
+			}
+		}
 	}
 	return url.PathEscape(norm.NFC.String(name))
+}
+
+func isGenericStreamName(name string) bool {
+	name = strings.ToLower(name)
+	return name == "stream" || strings.HasPrefix(name, "stream.")
+}
+
+func queryValueFold(values url.Values, key string) string {
+	for name, entries := range values {
+		if strings.EqualFold(name, key) && len(entries) > 0 {
+			return entries[0]
+		}
+	}
+	return ""
 }
 
 // show: a file name for the OSD.
